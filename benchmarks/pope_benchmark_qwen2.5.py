@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--output", type=str, default=None, help="Output JSONL file (auto-generated from mode if not set)")
     parser.add_argument("--dataset", type=str, default="Rajarshi-Roy-research/lmms-lab-POPE")
     parser.add_argument("--split", type=str, default="test_with_depth")
-    parser.add_argument("--device", type=str, default="cuda", help="Device for depth/caption pipeline.")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for depth/caption pipeline.")
     parser.add_argument("--mode", type=str, default="ldp_spatial", choices=["ldp", "ldp_spatial"])
     
     # Qwen-specific arguments

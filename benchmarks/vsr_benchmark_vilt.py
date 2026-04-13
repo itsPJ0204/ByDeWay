@@ -204,6 +204,13 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
+    # Configure session with retries to prevent TCP/DNS exhaustion
+    session = requests.Session()
+    retries = __import__('urllib3').util.retry.Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = requests.adapters.HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
     with open(args.output, "w", encoding="utf-8") as f_out:
         for idx, row in enumerate(tqdm(ds, desc="Evaluating")):
             caption = row.get("caption", "")
@@ -216,7 +223,7 @@ def main():
             # Load image from COCO URL
             if image_link:
                 try:
-                    resp = requests.get(image_link, timeout=15)
+                    resp = session.get(image_link, timeout=15)
                     resp.raise_for_status()
                     image = Image.open(BytesIO(resp.content))
                 except Exception as e:

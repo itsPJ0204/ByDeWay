@@ -192,7 +192,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="cambridgeltl/vsr_random",
                         help="HF dataset repo (cambridgeltl/vsr_random or cambridgeltl/vsr_zeroshot).")
     parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--device", type=str, default="cuda",
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device for depth/caption pipeline.")
     parser.add_argument("--mode", type=str, default="ldp_spatial",
                         choices=["baseline", "ldp", "ldp_spatial"])
@@ -267,6 +267,13 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
+    # Configure session with retries to prevent TCP/DNS exhaustion
+    session = http_requests.Session()
+    retries = __import__('urllib3').util.retry.Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = http_requests.adapters.HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
     with open(args.output, "w", encoding="utf-8") as f_out:
         for idx, row in enumerate(tqdm(ds, desc="Evaluating")):
             caption = row.get("caption", "")
@@ -279,7 +286,7 @@ def main():
             # Load image from COCO URL
             if image_link:
                 try:
-                    resp = http_requests.get(image_link, timeout=15)
+                    resp = session.get(image_link, timeout=15)
                     resp.raise_for_status()
                     image = Image.open(BytesIO(resp.content))
                 except Exception as e:
