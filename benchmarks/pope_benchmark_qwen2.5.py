@@ -97,7 +97,7 @@ def ask_qwen_yes_no(
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                {"type": "image", "image": image, "max_pixels": 313600},
                 {"type": "text", "text": prompt},
             ],
         }
@@ -157,8 +157,9 @@ def main():
     # Using device_map="auto" to efficiently distribute the model across available GPUs
     qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.qwen_model_path,
-        torch_dtype="auto",
-        device_map="auto"
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
     )
     # Put Qwen in evaluation mode
     qwen_model.eval()

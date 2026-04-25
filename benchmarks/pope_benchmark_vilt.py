@@ -59,7 +59,7 @@ def _compact_context(context: str, max_chars: int = 400) -> str:
     return c[: max_chars - 3].rstrip() + "..."
 
 def _predict_vilt(vqa_model, processor, image, prompt):
-    inputs = processor(image, prompt, return_tensors="pt", truncation=True, max_length=40).to(vqa_model.device)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40).to(vqa_model.device)
     with torch.no_grad():
         outputs = vqa_model(**inputs)
         logits = outputs.logits

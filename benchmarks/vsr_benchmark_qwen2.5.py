@@ -19,6 +19,7 @@ import re
 import argparse
 import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import numpy as np
@@ -144,7 +145,7 @@ def ask_qwen_true_false(
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                {"type": "image", "image": image, "max_pixels": 313600},
                 {"type": "text", "text": prompt},
             ],
         }
@@ -233,8 +234,9 @@ def main():
     print(f"\n[2/4] Loading Qwen Model ({args.qwen_model_path})...")
     qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.qwen_model_path,
-        torch_dtype="auto",
+        torch_dtype=torch.bfloat16,
         device_map="auto",
+        attn_implementation="sdpa",
     )
     qwen_model.eval()
     qwen_processor = AutoProcessor.from_pretrained(args.qwen_model_path)
@@ -274,30 +276,39 @@ def main():
     session.mount('http://', adapter)
     session.mount('https://', adapter)
 
+    # ── Async image prefetch helper ─────────────────────────────
+    def _fetch_image(row_with_idx):
+        """Download a single image in a background thread. Returns (idx, row, PIL.Image|None)."""
+        i, r = row_with_idx
+        link = r.get("image_link", "")
+        if not link:
+            return i, r, None
+        try:
+            resp = session.get(link, timeout=15)
+            resp.raise_for_status()
+            img = Image.open(BytesIO(resp.content))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            return i, r, img
+        except Exception:
+            return i, r, None
+
+    prefetch_workers = 8  # parallel HTTP downloads
+
     with open(args.output, "w", encoding="utf-8") as f_out:
-        for idx, row in enumerate(tqdm(ds, desc="Evaluating")):
+      with ThreadPoolExecutor(max_workers=prefetch_workers) as pool:
+        # Submit all downloads eagerly; iterate results in order
+        futures = pool.map(_fetch_image, enumerate(ds))
+        for idx, row, image in tqdm(futures, desc="Evaluating", total=len(ds)):
             caption = row.get("caption", "")
             label = int(row.get("label", 0))
             relation = row.get("relation", "")
-            image = row.get("image", None)
             image_link = row.get("image_link", "")
             category = RELATION_TO_CATEGORY.get(relation, "unallocated")
 
-            # Load image from COCO URL
-            if image_link:
-                try:
-                    resp = session.get(image_link, timeout=15)
-                    resp.raise_for_status()
-                    image = Image.open(BytesIO(resp.content))
-                except Exception as e:
-                    print(f"[{idx}] Failed to load image from {image_link}: {e}")
-                    continue
-            else:
-                print(f"[{idx}] No image_link available, skipping.")
+            if image is None:
+                print(f"[{idx}] Failed to load image from {image_link}, skipping.")
                 continue
-
-            if image.mode != "RGB":
-                image = image.convert("RGB")
 
             # Build context
             context = ""
