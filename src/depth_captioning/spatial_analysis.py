@@ -4,9 +4,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-# ──────────────────────────────────────────────────────────────────────
 # VSR spatial-relation categories (for per-category reporting)
-# ──────────────────────────────────────────────────────────────────────
+
 VSR_CATEGORIES = {
     "adjacency": [
         "adjacent to", "alongside", "at the side of", "at the right side of",
@@ -38,7 +37,6 @@ VSR_CATEGORIES = {
     ],
 }
 
-# Reverse lookup: relation_name -> category
 RELATION_TO_CATEGORY = {}
 for cat, rels in VSR_CATEGORIES.items():
     for r in rels:
@@ -51,15 +49,39 @@ class SpatialAnalyzer:
         Initialize the SpatialAnalyzer with a YOLO model.
         Args:
             model_path (str): Path or name of the YOLO model to load.
+                              Supports standard YOLO (e.g. yolov8n.pt) and
+                              YOLO-World models (e.g. yolov8l-worldv2.pt).
         """
         print(f"Initializing SpatialAnalyzer with model='{model_path}'...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = YOLO(model_path)
+        self.is_yolo_world = "world" in model_path.lower()
+        if self.is_yolo_world:
+            from ultralytics import YOLOWorld
+            self.model = YOLOWorld(model_path)
+        else:
+            self.model = YOLO(model_path)
+        self._current_classes = None
         print("SpatialAnalyzer initialized.")
 
-    # ──────────────────────────────────────────────────────────────────
-    # Original method — unchanged for backward compatibility
-    # ──────────────────────────────────────────────────────────────────
+    def set_classes(self, classes):
+        """Set target classes for YOLO-World open-vocabulary detection.
+
+        When using a YOLO-World model, this tells the detector exactly which
+        objects to look for. Includes caching to avoid redundant text-encoder
+        calls when the same classes are requested consecutively.
+
+        Args:
+            classes (list[str]): List of class names to detect.
+                                 Only effective when using a YOLO-World model.
+        """
+        if not self.is_yolo_world or not classes:
+            return
+        sorted_classes = sorted(set(c.strip() for c in classes if c.strip()))
+        if sorted_classes == self._current_classes:
+            return
+        self.model.set_classes(sorted_classes)
+        self._current_classes = sorted_classes
+
     def analyze(self, image_array, masks, max_relations_per_layer: int = 6):
         """
         Analyze the image and return spatial relationships between objects within the same depth layer.
@@ -224,9 +246,6 @@ class SpatialAnalyzer:
             
         return full_descriptions
 
-    # ──────────────────────────────────────────────────────────────────
-    # NEW: Enhanced spatial analysis for VSR benchmark
-    # ──────────────────────────────────────────────────────────────────
 
     def _detect_objects(self, image_array):
         """Run YOLO and return a list of detected object dicts."""
@@ -485,6 +504,8 @@ class SpatialAnalyzer:
             rels.append(self._make_rel(lb, la, "adjacent to", "adjacency", 0.75))
             rels.append(self._make_rel(la, lb, "alongside", "adjacency", 0.7))
             rels.append(self._make_rel(lb, la, "alongside", "adjacency", 0.7))
+            rels.append(self._make_rel(la, lb, "at the side of", "adjacency", 0.7))
+            rels.append(self._make_rel(lb, la, "at the side of", "adjacency", 0.7))
 
             # at the right/left side of
             if ca[0] < cb[0]:
@@ -499,6 +520,8 @@ class SpatialAnalyzer:
             rels.append(self._make_rel(lb, la, "touching", "topological", 0.7))
             rels.append(self._make_rel(la, lb, "against", "adjacency", 0.65))
             rels.append(self._make_rel(lb, la, "against", "adjacency", 0.65))
+            rels.append(self._make_rel(la, lb, "attached to", "adjacency", 0.6))
+            rels.append(self._make_rel(lb, la, "attached to", "adjacency", 0.6))
 
         # Ahead of / at the back of (depth-based adjacency)
         if has_depth and "depth" in obj_a and "depth" in obj_b:
@@ -535,6 +558,70 @@ class SpatialAnalyzer:
         if (ca[1] < cb[1] and iou > 0.05 and y_overlap > 0
                 and obj_a["area"] < obj_b["area"] * 2):
             rels.append(self._make_rel(la, lb, "on", "topological", 0.6))
+
+        # at the edge of: A is partially overlapping B's boundary region
+        if 0.05 < containment_a_in_b < 0.75 and edge_dist < 0.05 * img_diag:
+            rels.append(self._make_rel(la, lb, "at the edge of", "adjacency", 0.6))
+        if 0.05 < containment_b_in_a < 0.75 and edge_dist < 0.05 * img_diag:
+            rels.append(self._make_rel(lb, la, "at the edge of", "adjacency", 0.6))
+
+        # connected to — objects are touching or overlapping
+        if edge_dist < 3 or iou > 0.01:
+            rels.append(self._make_rel(la, lb, "connected to", "topological", 0.6))
+            rels.append(self._make_rel(lb, la, "connected to", "topological", 0.6))
+
+        # detached from — objects are clearly separated
+        if edge_dist > 0.1 * img_diag and iou < 0.01:
+            rels.append(self._make_rel(la, lb, "detached from", "topological", 0.6))
+            rels.append(self._make_rel(lb, la, "detached from", "topological", 0.6))
+
+        # has as a part / consists of — one largely contains the other (relaxed)
+        if containment_b_in_a > 0.6:
+            rels.append(self._make_rel(la, lb, "has as a part", "topological", 0.55))
+            rels.append(self._make_rel(la, lb, "consists of", "topological", 0.5))
+        if containment_a_in_b > 0.6:
+            rels.append(self._make_rel(lb, la, "has as a part", "topological", 0.55))
+            rels.append(self._make_rel(lb, la, "consists of", "topological", 0.5))
+
+        # part of — A is contained within B
+        if containment_a_in_b > 0.6:
+            rels.append(self._make_rel(la, lb, "part of", "topological", 0.55))
+        if containment_b_in_a > 0.6:
+            rels.append(self._make_rel(lb, la, "part of", "topological", 0.55))
+
+        # outside — A is clearly not inside B (with proximity to avoid noise)
+        if containment_a_in_b < 0.1 and norm_dist < 0.4:
+            rels.append(self._make_rel(la, lb, "outside", "topological", 0.55))
+        if containment_b_in_a < 0.1 and norm_dist < 0.4:
+            rels.append(self._make_rel(lb, la, "outside", "topological", 0.55))
+
+        # out of — A is just outside B (near but not inside)
+        if containment_a_in_b < 0.15 and edge_dist < 0.05 * img_diag:
+            rels.append(self._make_rel(la, lb, "out of", "topological", 0.5))
+        if containment_b_in_a < 0.15 and edge_dist < 0.05 * img_diag:
+            rels.append(self._make_rel(lb, la, "out of", "topological", 0.5))
+
+        # at — general location association (close or overlapping)
+        if norm_dist < 0.2 or iou > 0.05:
+            rels.append(self._make_rel(la, lb, "at", "topological", 0.5))
+            rels.append(self._make_rel(lb, la, "at", "topological", 0.5))
+
+        # with — general co-presence (objects in same area)
+        if norm_dist < 0.3:
+            rels.append(self._make_rel(la, lb, "with", "topological", 0.5))
+            rels.append(self._make_rel(lb, la, "with", "topological", 0.5))
+
+        # among — A is partially within B's area
+        if 0.15 < containment_a_in_b < 0.75 and iou > 0.05:
+            rels.append(self._make_rel(la, lb, "among", "topological", 0.45))
+        if 0.15 < containment_b_in_a < 0.75 and iou > 0.05:
+            rels.append(self._make_rel(lb, la, "among", "topological", 0.45))
+
+        # between — A is positioned within B's spatial extent (approximate)
+        if 0.3 < containment_a_in_b < 0.7:
+            rels.append(self._make_rel(la, lb, "between", "topological", 0.45))
+        if 0.3 < containment_b_in_a < 0.7:
+            rels.append(self._make_rel(lb, la, "between", "topological", 0.45))
 
         # Next to (unallocated — general proximity with some offset)
         if 0.05 < norm_dist < 0.3:

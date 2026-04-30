@@ -58,6 +58,25 @@ def _shorten(text: str, max_words: int = 18) -> str:
     return " ".join(words[:max_words]) + " ..."
 
 
+def parse_vsr_caption(caption, relation):
+    """Extract subject and object names from a VSR caption.
+
+    VSR captions follow patterns like:
+      "The {subj} is {relation} the {obj}."
+      "The {subj} {relation} the {obj}."
+
+    Returns:
+        tuple: (subject_name, object_name) or (None, None) if parsing fails.
+    """
+    text = caption.strip().rstrip(".")
+    for marker in [f" is {relation} the ", f" {relation} the "]:
+        if marker in text:
+            left, right = text.split(marker, 1)
+            subj = left[4:] if left.startswith("The ") else left
+            return subj.strip(), right.strip()
+    return None, None
+
+
 def normalize_true_false(text: str) -> str:
     """Normalize model output to 'true' or 'false'."""
     if not text:
@@ -201,7 +220,7 @@ def parse_args():
     parser.add_argument("--qwen_model_path", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--depth_encoder", type=str, default="vits",
                         choices=["vits", "vitb", "vitl", "vitg"])
-    parser.add_argument("--yolo_model", type=str, default="yolov8n.pt")
+    parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt")
     parser.add_argument("--max_new_tokens", type=int, default=10)
     return parser.parse_args()
 
@@ -314,6 +333,11 @@ def main():
             context = ""
             vsr_spatial = ""
             if args.mode != "baseline" and depth_captioner is not None:
+                # Set YOLO-World target classes for this sample's objects
+                subj, obj = parse_vsr_caption(caption, relation)
+                if subj and obj:
+                    depth_captioner.spatial_analyzer.set_classes([subj, obj])
+
                 try:
                     context = build_ldp_context(depth_captioner, image, args.mode)
                 except Exception as e:

@@ -58,6 +58,25 @@ def _compress_for_vilt(text: str, max_words: int = 6) -> str:
     return " ".join(words[:max_words])
 
 
+def parse_vsr_caption(caption, relation):
+    """Extract subject and object names from a VSR caption.
+
+    VSR captions follow patterns like:
+      "The {subj} is {relation} the {obj}."
+      "The {subj} {relation} the {obj}."
+
+    Returns:
+        tuple: (subject_name, object_name) or (None, None) if parsing fails.
+    """
+    text = caption.strip().rstrip(".")
+    for marker in [f" is {relation} the ", f" {relation} the "]:
+        if marker in text:
+            left, right = text.split(marker, 1)
+            subj = left[4:] if left.startswith("The ") else left
+            return subj.strip(), right.strip()
+    return None, None
+
+
 def _predict_vilt(vqa_model, processor, image, prompt):
     """Run ViLT and return (answer_str, confidence_float)."""
     inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40).to(vqa_model.device)
@@ -143,7 +162,7 @@ def parse_args():
                         help="ViLT VQA checkpoint.")
     parser.add_argument("--depth_encoder", type=str, default="vits",
                         choices=["vits", "vitb", "vitl", "vitg"])
-    parser.add_argument("--yolo_model", type=str, default="yolov8n.pt")
+    parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt")
     parser.add_argument("--mode", type=str, default="ldp_spatial",
                         choices=["baseline", "ldp", "ldp_spatial"])
     parser.add_argument("--device", type=str,
@@ -244,6 +263,11 @@ def main():
             context = ""
             vsr_spatial = ""
             if args.mode != "baseline" and depth_captioner is not None:
+                # Set YOLO-World target classes for this sample's objects
+                subj, obj = parse_vsr_caption(caption, relation)
+                if subj and obj:
+                    depth_captioner.spatial_analyzer.set_classes([subj, obj])
+
                 try:
                     context = build_ldp_context(depth_captioner, image, args.mode)
                 except Exception as e:
