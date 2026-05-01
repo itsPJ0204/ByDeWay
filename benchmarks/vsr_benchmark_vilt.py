@@ -342,17 +342,28 @@ def main():
                     raw_pred = json.dumps({"strategy": "ldp_vote", "margin": vote_margin, "details": details})
 
                 elif args.mode == "spatial":
-                    # Spatial-only: single inference with original image + compact spatial context
-                    spatial_ctx = _compress_for_vilt(vsr_spatial, 15) if vsr_spatial else ""
-                    if spatial_ctx:
-                        prompt = f'Q: {question} Ctx: {spatial_ctx}. A:'
-                    else:
-                        prompt = question
-
-                    pred_yn, scores = _vilt_yes_no_scores(vqa_model, vqa_processor, image, prompt)
+                    # Spatial-only: Logit Ensembling (Mathematical Voting)
+                    pred_yn, scores = _vilt_yes_no_scores(vqa_model, vqa_processor, image, question)
+                    m = scores.get("yes", 0) - scores.get("no", 0)
+                    
+                    yolo_vote = 0.0
+                    if vsr_spatial:
+                        vsr_lower = vsr_spatial.lower()
+                        rel_lower = relation.lower()
+                        if rel_lower in vsr_lower:
+                            yolo_vote = 3.0  # YOLO confirms relation
+                        elif subj and obj and (subj.lower() in vsr_lower) and (obj.lower() in vsr_lower):
+                            yolo_vote = -3.0 # YOLO found objects but not this relation
+                            
+                    m += yolo_vote
+                    pred_yn = "yes" if m >= 0 else "no"
+                    
                     raw_pred = json.dumps({
-                        "strategy": "spatial_only", "pred": pred_yn, "scores": scores,
-                        "spatial_ctx": spatial_ctx
+                        "strategy": "spatial_logit_ensemble", 
+                        "pred": pred_yn, 
+                        "original_scores": scores,
+                        "yolo_vote": yolo_vote,
+                        "spatial_ctx": vsr_spatial
                     })
 
                 else:  # ldp_spatial
@@ -365,16 +376,21 @@ def main():
                     details = []
 
                     # Original + spatial
-                    spatial_bits = []
-                    if vsr_spatial:
-                        spatial_bits.append(f"Spatial: {_compress_for_vilt(vsr_spatial, 20)}")
-                    spatial_ctx = ". ".join(spatial_bits) if spatial_bits else ""
-                    enriched_q = f'Q: {question} Ctx: {spatial_ctx}. A:' if spatial_ctx else question
-
-                    base_pred, base_scores = _vilt_yes_no_scores(vqa_model, vqa_processor, image, enriched_q)
+                    base_pred, base_scores = _vilt_yes_no_scores(vqa_model, vqa_processor, image, question)
                     base_margin = base_scores.get("yes", 0) - base_scores.get("no", 0)
+                    
+                    yolo_vote = 0.0
+                    if vsr_spatial:
+                        vsr_lower = vsr_spatial.lower()
+                        rel_lower = relation.lower()
+                        if rel_lower in vsr_lower:
+                            yolo_vote = 1.0
+                        elif subj and obj and (subj.lower() in vsr_lower) and (obj.lower() in vsr_lower):
+                            yolo_vote = -1.0
+                            
+                    base_margin += yolo_vote
                     vote_margin += base_margin
-                    details.append({"view": "original+spatial", "pred": base_pred, "margin": base_margin})
+                    details.append({"view": "original+spatial", "pred": base_pred, "margin": base_margin, "yolo_vote": yolo_vote})
 
                     # Mid Range layer + spatial
                     li = 2
