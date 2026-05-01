@@ -5,7 +5,6 @@ Demonstrates that YOLO-World with per-sample class targeting detects
 the RELEVANT objects from VSR captions, while YOLOv8n often detects
 irrelevant objects or misses the target objects entirely.
 
-Runs on CPU — no VLM required.
 
 Usage:
     python benchmarks/compare_detectors.py --num_samples 30
@@ -45,7 +44,7 @@ def parse_vsr_caption(caption, relation):
 
 def get_detections(analyzer, image_array):
     """Run object detection and return list of (label, confidence) tuples."""
-    results = analyzer.model(image_array, verbose=False, stream=False)
+    results = analyzer.model(image_array, verbose=False, stream=False, device=analyzer.device)
     result = results[0]
     names = result.names
     detections = []

@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--qwen_model_path", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", 
                         help="Hugging Face model path for Qwen 2.5-VL.")
     parser.add_argument("--depth_encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
-    parser.add_argument("--yolo_model", type=str, default="yolov8n.pt")
+    parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt")
     parser.add_argument("--max_new_tokens", type=int, default=10, help="Max tokens for Qwen generation.")
     return parser.parse_args()
 
@@ -60,19 +60,39 @@ def normalize_yes_no(text: str) -> str:
     return "unknown"
 
 
-def build_ldp_context(depth_captioner: DepthBlipCaptioner, image: Image.Image, mode: str) -> str:
+def parse_pope_object(question):
+    """Extract the target object name from a POPE question.
+
+    POPE questions follow: 'Is there a {object} in the image?'
+
+    Returns:
+        str or None: The object name, or None if parsing fails.
+    """
+    import re as _re
+    m = _re.search(r'Is there (?:a |an )?(.+?) in the image', question, _re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def build_ldp_context(depth_captioner: DepthBlipCaptioner, image: Image.Image, mode: str, target_obj: str = None) -> str:
     layer_names = ["Closest", "Farthest", "Mid Range"]
     layer_imgs, masks = depth_captioner.depth_context.make_depth_context_img(
         image, top_threshold=70, bottom_threshold=30, return_masks=True
     )
-    spatial = depth_captioner.spatial_analyzer.analyze(np.array(image), masks, max_relations_per_layer=6)
+    
+    vsr_spatial = ""
+    if mode == "ldp_spatial" and target_obj:
+        is_present = depth_captioner.spatial_analyzer.check_presence(np.array(image), target_obj)
+        if is_present:
+            vsr_spatial = f"Yes, there is a {target_obj} in the image."
+        else:
+            vsr_spatial = f"No, there is no {target_obj} in the image."
 
     blocks = []
     for idx, layer_np in enumerate(layer_imgs):
         caption = depth_captioner.captioner.get_caption(layer_np)
         block = f"{layer_names[idx]}: {caption}"
-        if mode == "ldp_spatial" and spatial[idx]:
-            block += f"\nSpatial Relationships: {spatial[idx]}"
+        if mode == "ldp_spatial" and vsr_spatial:
+            block += f"\nHint: {vsr_spatial}"
         blocks.append(block)
     return "\n----\n".join(blocks)
 
@@ -189,7 +209,10 @@ def main():
                 image = image.convert("RGB")
 
             try:
-                context = build_ldp_context(depth_captioner, image, args.mode)
+                # Set YOLO-World target class for this question's object
+                target_obj = parse_pope_object(question)
+
+                context = build_ldp_context(depth_captioner, image, args.mode, target_obj)
             except Exception as exc:
                 print(f"[{idx}] context error: {exc}")
                 context = "No depth context available."

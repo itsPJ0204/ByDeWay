@@ -51,6 +51,18 @@ def _normalize_yes_no(text: str) -> str:
         return "no"
     return "unknown"
 
+def parse_pope_object(question):
+    """Extract the target object name from a POPE question.
+
+    POPE questions follow: 'Is there a {object} in the image?'
+
+    Returns:
+        str or None: The object name, or None if parsing fails.
+    """
+    import re as _re
+    m = _re.search(r'Is there (?:a |an )?(.+?) in the image', question, _re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
 def _compact_context(context: str, max_chars: int = 400) -> str:
     """
     Keep context length capped so the question is not truncated.
@@ -90,11 +102,11 @@ def parse_args():
     parser.add_argument("--split", type=str, default="test_with_depth", help="Dataset split to use")
     parser.add_argument("--vqa_model", type=str, default="dandelin/vilt-b32-finetuned-vqa", help="ViLT VQA checkpoint")
     parser.add_argument("--depth_encoder", type=str, default="vits", choices=["vits","vitb","vitl","vitg"], help="Depth Anything V2 encoder size.")
-    parser.add_argument("--yolo_model", type=str, default="yolov8n.pt", help="YOLO model for spatial analysis.")
+    parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt", help="YOLO model for spatial analysis.")
     parser.add_argument("--use_context", action="store_true", help="Include LDP+spatial context in the text prompt (baseline).")
     parser.add_argument("--layer_vote", action="store_true", help="Use layer-wise voting.")
     parser.add_argument("--orig_conf_threshold", type=float, default=2.0, help="Confidence threshold to trust original view.")
-    parser.add_argument("--vote_mode", type=str, default="ldp_spatial", choices=["ldp", "ldp_spatial"], help="Voting strategy.")
+    parser.add_argument("--vote_mode", type=str, default="ldp_spatial", choices=["ldp", "ldp_spatial", "spatial"], help="Voting strategy.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for models (cpu/cuda)")
     return parser.parse_args()
 
@@ -106,13 +118,20 @@ def main():
     print(f"Starting POPE Benchmark for ViLT on device: {args.device}")
     print(f"Vote mode: {args.vote_mode} | Output: {args.output}")
     
-    # 1. Initialize depth context creator
-    print("\n[1/3] Initializing DepthBlipCaptioner ...")
-    depth_captioner = DepthBlipCaptioner(
-        device=torch.device(args.device),
-        encoder=args.depth_encoder,
-        yolo_model_path=args.yolo_model,
-    )
+    # 1. Initialize depth context creator or spatial analyzer
+    depth_captioner = None
+    spatial_analyzer = None
+    if args.vote_mode == "spatial":
+        print("\n[1/3] Initializing SpatialAnalyzer only (spatial mode)...")
+        from src.depth_captioning.spatial_analysis import SpatialAnalyzer
+        spatial_analyzer = SpatialAnalyzer(model_path=args.yolo_model)
+    else:
+        print("\n[1/3] Initializing DepthBlipCaptioner ...")
+        depth_captioner = DepthBlipCaptioner(
+            device=torch.device(args.device),
+            encoder=args.depth_encoder,
+            yolo_model_path=args.yolo_model,
+        )
     
     # 2. Initialize ViLT VQA model
     print(f"\n[2/3] Initializing ViLT VQA model ({args.vqa_model})...")
@@ -152,21 +171,58 @@ def main():
                 image = image.convert("RGB")
             
             # ---> Step A: Context Generation
+            spatial_depth_caption = "N/A"
+            vsr_spatial = ""
             try:
-                spatial_depth_caption = depth_captioner.get_caption_with_depth(image)
+                # Set YOLO-World target class for this question's object
+                target_obj = parse_pope_object(question)
+                
+                if args.vote_mode == "spatial" and spatial_analyzer is not None:
+                    image_array = np.array(image)
+                    is_present = spatial_analyzer.check_presence(image_array, target_obj)
+                    if is_present:
+                        vsr_spatial = f"Yes, there is a {target_obj} in the image."
+                    else:
+                        vsr_spatial = f"No, there is no {target_obj} in the image."
+                    
+                elif depth_captioner is not None:
+                    image_array = np.array(image)
+                    is_present = depth_captioner.spatial_analyzer.check_presence(image_array, target_obj)
+                    if is_present:
+                        vsr_spatial = f"Yes, there is a {target_obj} in the image."
+                    else:
+                        vsr_spatial = f"No, there is no {target_obj} in the image."
+                    spatial_depth_caption = depth_captioner.get_caption_with_depth(image)
             except Exception as e:
-                print(f"Error generating depth/spatial caption for idx {idx}: {e}")
+                print(f"Error generating depth/spatial context for idx {idx}: {e}")
                 spatial_depth_caption = "No depth context available."
+                vsr_spatial = ""
             
             # ---> Step B/C: Predict Answer
             layer_details = []
             try:
-                if args.layer_vote:
+                if args.vote_mode == "spatial":
+                    # Spatial-only: Logit Ensembling instead of text prompting
+                    raw_pred, y_score, n_score = _predict_vilt(vqa_model, vqa_processor, image, question)
+                    m = y_score - n_score
+                    
+                    # YOLO mathematically boosts the logits
+                    yolo_boost = 3.0 if is_present else -3.0
+                    m += yolo_boost
+                    
+                    pred_answer = "yes" if m >= 0 else "no"
+                    
+                    raw_pred_json = json.dumps({
+                        "strategy": "spatial_logit_ensemble", 
+                        "yolo_present": is_present,
+                        "original_margin": y_score - n_score,
+                        "final_margin": m
+                    })
+                    raw_pred = raw_pred_json
+
+                elif args.layer_vote:
                     layer_imgs_np, masks = depth_captioner.depth_context.make_depth_context_img(
                         image, top_threshold=70, bottom_threshold=30, return_masks=True
-                    )
-                    layer_rel = depth_captioner.spatial_analyzer.analyze(
-                        np.array(image), masks, max_relations_per_layer=6
                     )
                     layer_names = ["Closest", "Farthest", "Mid Range"]
 
@@ -195,27 +251,27 @@ def main():
                             raw_pred = json.dumps({"strategy": "ldp_vote", "vote_margin": vote_margin, "details": layer_details})
 
                         else:
-                            # LDP+Spatial: Iterate over all layers to gather 3 votes and avoid token truncation
+                            # LDP+Spatial: Iterate over all layers to gather 3 votes
                             for li, layer_np in enumerate(layer_imgs_np):
                                 layer_pil = Image.fromarray(layer_np.astype("uint8"))
-                                rel_text = layer_rel[li]
-
+                                
                                 caption = _compress_for_vilt(depth_captioner.captioner.get_caption(layer_np), max_words=6)
-                                rel_text = _compress_for_vilt(rel_text, max_words=8)
 
                                 ctx_bits = []
                                 if caption:
-                                    ctx_bits.append(f"[{layer_names[li][:3]}] {caption}.")
-                                if rel_text:
-                                    ctx_bits.append(f"[Sp] {rel_text}.")
+                                    ctx_bits.append(f"({layer_names[li][:3]} layer: {caption})")
                                 small_ctx = " ".join(ctx_bits)
 
-                                layer_prompt = f"Question: {question} Context: {small_ctx}. Answer:"
+                                layer_prompt = f"{small_ctx} {question}" if small_ctx else question
                                 lp, ys, ns = _predict_vilt(vqa_model, vqa_processor, layer_pil, layer_prompt)
                                 
                                 m = ys - ns
+                                # Logit Ensembling: mathematically sway the vote
+                                yolo_vote = 1.0 if is_present else -1.0
+                                m += yolo_vote
+                                
                                 vote_margin += m
-                                layer_details.append({"view": layer_names[li], "pred": lp, "margin": m, "caption": caption, "spatial": rel_text})
+                                layer_details.append({"view": layer_names[li], "pred": lp, "margin": m, "caption": caption, "yolo_vote": yolo_vote})
 
                             pred_answer = "yes" if vote_margin >= 0 else "no"
                             raw_pred = json.dumps({"strategy": "ldp_spatial_vote", "vote_margin": vote_margin, "details": layer_details})

@@ -82,6 +82,31 @@ class SpatialAnalyzer:
         self.model.set_classes(sorted_classes)
         self._current_classes = sorted_classes
 
+    def check_presence(self, image: np.ndarray, target_obj: str) -> bool:
+        """
+        Check if a specific object is present in the image.
+        Used primarily for POPE hallucination benchmark.
+        """
+        if not target_obj:
+            return False
+            
+        self.set_classes([target_obj])
+        results = self.model.predict(image, verbose=False, device=self.device)
+        result = results[0]
+        
+        if not result.boxes:
+            return False
+            
+        names = result.names
+        target_lower = target_obj.lower()
+        
+        for box in result.boxes:
+            cls = int(box.cls[0])
+            label = names[cls].lower()
+            if target_lower in label or label in target_lower:
+                return True
+        return False
+
     def analyze(self, image_array, masks, max_relations_per_layer: int = 6):
         """
         Analyze the image and return spatial relationships between objects within the same depth layer.

@@ -49,6 +49,18 @@ def _normalize_yes_no(text: str) -> str:
         return "no"
     return "unknown"
 
+def parse_pope_object(question):
+    """Extract the target object name from a POPE question.
+
+    POPE questions follow: 'Is there a {object} in the image?'
+
+    Returns:
+        str or None: The object name, or None if parsing fails.
+    """
+    import re as _re
+    m = _re.search(r'Is there (?:a |an )?(.+?) in the image', question, _re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
 def _compact_context(context: str, max_chars: int = 600) -> str:
     """
     Prevent BLIP tokenizer truncation from chopping off the question.
@@ -94,7 +106,7 @@ def parse_args():
     parser.add_argument("--split", type=str, default="test_with_depth", help="Dataset split to use")
     parser.add_argument("--vqa_model", type=str, default="Salesforce/blip-vqa-base", help="BLIP VQA checkpoint (try 'Salesforce/blip-vqa-capfilt-large' for higher accuracy).")
     parser.add_argument("--depth_encoder", type=str, default="vits", choices=["vits","vitb","vitl","vitg"], help="Depth Anything V2 encoder size.")
-    parser.add_argument("--yolo_model", type=str, default="yolov8n.pt", help="YOLO model for spatial analysis (try yolov8s.pt).")
+    parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt", help="YOLO model for spatial analysis (default: yolov8l-worldv2.pt).")
     parser.add_argument("--use_context", action="store_true", help="Include LDP+spatial context in the text prompt (for non-voting baseline).")
     parser.add_argument("--layer_vote", action="store_true", help="Use layer-wise BLIP voting (recommended for LDP+Spatial).")
     parser.add_argument("--orig_conf_threshold", type=float, default=2.0, help="If |original_margin| >= threshold, trust original view and skip layer voting.")
@@ -162,12 +174,23 @@ def main():
                 image = image.convert("RGB")
             
             # ---> Step A: Generate LDP + Spatial Caption
-            # This uses Depth Anything -> Segment Depth -> YOLO Detect -> Spatial Analyzer -> Combine with BLIP caption
+            vsr_spatial = ""
             try:
-                spatial_depth_caption = depth_captioner.get_caption_with_depth(image)
+                target_obj = parse_pope_object(question)
+                if depth_captioner is not None:
+                    image_array = np.array(image)
+                    is_present = depth_captioner.spatial_analyzer.check_presence(image_array, target_obj)
+                    if is_present:
+                        vsr_spatial = f"Yes, there is a {target_obj} in the image."
+                    else:
+                        vsr_spatial = f"No, there is no {target_obj} in the image."
+                    spatial_depth_caption = depth_captioner.get_caption_with_depth(image)
+                else:
+                    spatial_depth_caption = ""
             except Exception as e:
-                print(f"Error generating depth/spatial caption for idx {idx}: {e}")
+                print(f"Error generating depth/spatial context for idx {idx}: {e}")
                 spatial_depth_caption = "No depth context available."
+                vsr_spatial = ""
             
             # ---> Step B/C: Predict Answer
             # Two modes:
@@ -178,10 +201,6 @@ def main():
                     # Build depth-layer images + masks
                     layer_imgs_np, masks = depth_captioner.depth_context.make_depth_context_img(
                         image, top_threshold=70, bottom_threshold=30, return_masks=True
-                    )
-                    # Spatial relations per layer (already capped inside analyzer)
-                    layer_rel = depth_captioner.spatial_analyzer.analyze(
-                        np.array(image), masks, max_relations_per_layer=6
                     )
                     layer_names = ["Closest", "Farthest", "Mid Range"]
 
@@ -247,24 +266,16 @@ def main():
                             # LDP+Spatial: consult Mid Range with tiny caption + spatial if needed.
                             li = 2  # Mid Range
                             layer_np = layer_imgs_np[li]
-                            rel_text = layer_rel[li]
                             layer_pil = Image.fromarray(layer_np.astype("uint8"))
 
                             caption = _shorten(depth_captioner.captioner.get_caption(layer_np), max_words=16)
-                            rel_text = _shorten(rel_text, max_words=24)
 
                             ctx_bits = []
                             if caption:
-                                ctx_bits.append(f"{layer_names[li]} caption: {caption}.")
-                            if rel_text:
-                                ctx_bits.append(f"{layer_names[li]} spatial: {rel_text}.")
+                                ctx_bits.append(f"({layer_names[li]} layer: {caption})")
                             small_ctx = " ".join(ctx_bits)
 
-                            layer_prompt = (
-                                f"Question: {question}\n"
-                                f"Context: {small_ctx}\n"
-                                f"Answer: yes or no."
-                            )
+                            layer_prompt = f"{small_ctx} {question}" if small_ctx else question
                             layer_inputs = vqa_processor(
                                 images=layer_pil,
                                 text=layer_prompt,
@@ -276,8 +287,13 @@ def main():
                                 vqa_model=vqa_model, tokenizer=vqa_processor.tokenizer, inputs=layer_inputs
                             )
                             m = ls["yes"] - ls["no"]
+                            
+                            # Logit Ensembling: mathematically sway the vote
+                            yolo_vote = 1.0 if is_present else -1.0
+                            m += yolo_vote
+                            
                             vote_margin += m
-                            layer_details.append({"view": layer_names[li], "pred": lp, "scores": ls, "margin": m, "caption": caption, "spatial": rel_text})
+                            layer_details.append({"view": layer_names[li], "pred": lp, "scores": ls, "margin": m, "caption": caption, "yolo_vote": yolo_vote})
 
                             pred_answer = "yes" if vote_margin >= 0 else "no"
                             raw_pred = json.dumps(

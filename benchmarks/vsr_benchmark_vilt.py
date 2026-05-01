@@ -164,7 +164,7 @@ def parse_args():
                         choices=["vits", "vitb", "vitl", "vitg"])
     parser.add_argument("--yolo_model", type=str, default="yolov8l-worldv2.pt")
     parser.add_argument("--mode", type=str, default="ldp_spatial",
-                        choices=["baseline", "ldp", "ldp_spatial"])
+                        choices=["baseline", "ldp", "ldp_spatial", "spatial"])
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -184,7 +184,13 @@ def main():
 
     # 1. Initialize depth + spatial pipeline
     depth_captioner = None
-    if args.mode != "baseline":
+    spatial_analyzer = None
+    if args.mode == "spatial":
+        # Spatial-only mode: just need the SpatialAnalyzer (no depth/BLIP)
+        print("\n[1/3] Initializing SpatialAnalyzer only (spatial mode)...")
+        from src.depth_captioning.spatial_analysis import SpatialAnalyzer
+        spatial_analyzer = SpatialAnalyzer(model_path=args.yolo_model)
+    elif args.mode != "baseline":
         print("\n[1/3] Initializing DepthBlipCaptioner (Depth + YOLO + BLIP Caption)...")
         depth_captioner = DepthBlipCaptioner(
             device=torch.device(args.device),
@@ -262,7 +268,24 @@ def main():
             # Build context
             context = ""
             vsr_spatial = ""
-            if args.mode != "baseline" and depth_captioner is not None:
+            if args.mode == "spatial" and spatial_analyzer is not None:
+                # Spatial-only: use standalone SpatialAnalyzer
+                subj, obj = parse_vsr_caption(caption, relation)
+                if subj and obj:
+                    spatial_analyzer.set_classes([subj, obj])
+                try:
+                    image_array = np.array(image)
+                    relations = spatial_analyzer.analyze_vsr(image_array, depth_map=None, max_relations=10)
+                    # Build compact spatial string: "cat above dining table, cat left of dining table"
+                    rel_strs = []
+                    for r in relations:
+                        rel_strs.append(f"{r['obj_a']} {r['relation']} {r['obj_b']}")
+                    vsr_spatial = ", ".join(rel_strs) if rel_strs else ""
+                except Exception as e:
+                    print(f"[{idx}] Spatial error: {e}")
+                    vsr_spatial = ""
+
+            elif args.mode != "baseline" and depth_captioner is not None:
                 # Set YOLO-World target classes for this sample's objects
                 subj, obj = parse_vsr_caption(caption, relation)
                 if subj and obj:
@@ -317,6 +340,20 @@ def main():
 
                     pred_yn = "yes" if vote_margin >= 0 else "no"
                     raw_pred = json.dumps({"strategy": "ldp_vote", "margin": vote_margin, "details": details})
+
+                elif args.mode == "spatial":
+                    # Spatial-only: single inference with original image + compact spatial context
+                    spatial_ctx = _compress_for_vilt(vsr_spatial, 15) if vsr_spatial else ""
+                    if spatial_ctx:
+                        prompt = f'Q: {question} Ctx: {spatial_ctx}. A:'
+                    else:
+                        prompt = question
+
+                    pred_yn, scores = _vilt_yes_no_scores(vqa_model, vqa_processor, image, prompt)
+                    raw_pred = json.dumps({
+                        "strategy": "spatial_only", "pred": pred_yn, "scores": scores,
+                        "spatial_ctx": spatial_ctx
+                    })
 
                 else:  # ldp_spatial
                     layer_imgs, masks = depth_captioner.depth_context.make_depth_context_img(
