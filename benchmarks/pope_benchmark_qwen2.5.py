@@ -133,7 +133,8 @@ def ask_qwen_yes_no(
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    ).to(model.device)
+    )
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     # Generate answer
     with torch.no_grad():

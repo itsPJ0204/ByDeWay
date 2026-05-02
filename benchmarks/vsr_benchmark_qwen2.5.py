@@ -179,7 +179,8 @@ def ask_qwen_true_false(
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    ).to(model.device)
+    )
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
         generated_ids = model.generate(

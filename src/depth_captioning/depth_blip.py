@@ -19,7 +19,8 @@ class BlipCaptioner:
 
     def get_caption(self, image_array):
         image = Image.fromarray(image_array.astype("uint8"))
-        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        inputs = self.processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         generated_ids = self.model.generate(**inputs)
         generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()

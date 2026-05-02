@@ -79,7 +79,8 @@ def parse_vsr_caption(caption, relation):
 
 def _predict_vilt(vqa_model, processor, image, prompt):
     """Run ViLT and return (answer_str, confidence_float)."""
-    inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40).to(vqa_model.device)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40)
+    inputs = {k: v.to(vqa_model.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = vqa_model(**inputs)
         logits = outputs.logits
@@ -94,7 +95,8 @@ def _vilt_yes_no_scores(vqa_model, processor, image, prompt):
     Get yes/no scores from ViLT's classification head.
     ViLT has a fixed label set from VQAv2 training — 'yes' and 'no' are in it.
     """
-    inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40).to(vqa_model.device)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", truncation=True, max_length=40)
+    inputs = {k: v.to(vqa_model.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = vqa_model(**inputs)
         logits = outputs.logits[0]

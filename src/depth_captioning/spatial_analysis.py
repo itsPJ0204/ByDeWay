@@ -122,7 +122,7 @@ class SpatialAnalyzer:
                   e.g., ["Object A is to the left of Object B...", "", ""]
         """
         # Run object detection
-        results = self.model(image_array, verbose=False, stream=False)
+        results = self.model(image_array, verbose=False, stream=False, device=self.device)
         result = results[0]
         
         full_descriptions = ["", "", ""] # Closest, Farthest, Mid
@@ -274,7 +274,7 @@ class SpatialAnalyzer:
 
     def _detect_objects(self, image_array):
         """Run YOLO and return a list of detected object dicts."""
-        results = self.model(image_array, verbose=False, stream=False)
+        results = self.model(image_array, verbose=False, stream=False, device=self.device)
         result = results[0]
         names = result.names
         objects = []
